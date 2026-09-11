@@ -69,6 +69,8 @@ adding new columns in Notion just works without touching the code. Leave `NOTION
 
 ## Run
 
+### Local Python run
+
 ```bash
 python main.py
 ```
@@ -76,6 +78,39 @@ python main.py
 On first run Telethon will prompt for your phone number + login code (and 2FA password if set)
 to create a local session file (`job_opportunities_session.session`). Subsequent runs reuse it
 — keep that file private, it's an authenticated login.
+
+Test the pipeline against existing messages locally:
+
+```bash
+python main.py --test-backfill              # last 10 messages
+python main.py --test-backfill --limit 25    # last 25 messages
+```
+
+### Run with Docker
+
+Build the image and pass your environment variables from a `.env` file:
+
+```bash
+cp .env.example .env
+# edit .env and fill in your Telegram, Gemini, Discord, and optional Notion values
+
+docker build -t tgfilter .
+docker run --rm --env-file .env tgfilter
+```
+
+If you want the Telethon session to persist across container restarts, mount the session file:
+
+```bash
+docker run --rm --env-file .env \
+  -v "${PWD}/job_opportunities_session.session:/app/job_opportunities_session.session" \
+  tgfilter
+```
+
+You can also run the backfill test inside Docker:
+
+```bash
+docker run --rm --env-file .env tgfilter --test-backfill --limit 25
+```
 
 ### Test the pipeline against existing messages
 

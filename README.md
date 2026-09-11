@@ -3,7 +3,8 @@
 Listens to a Telegram group chat, uses Gemini to detect and summarize job/internship/opportunity
 posts (including details buried in attached PDFs/images/docx files), and posts a formatted
 notification — with survey link, requirements, and due date — to a Discord channel via webhook.
-Non-opportunity messages are silently ignored.
+Non-opportunity messages are silently ignored. Optionally, it cross-references a Notion database
+of members and @mentions anyone it fuzzy-matches in the message/attachments.
 
 ## How it works
 
@@ -11,7 +12,8 @@ Non-opportunity messages are silently ignored.
 2. As each message arrives, any attachment is downloaded and immediately converted into Gemini
    content: PDFs/images are uploaded to Gemini's Files API (handles persist ~48h), `.docx` is
    parsed locally with `python-docx`, plain text files are read directly. The local file is then
-   deleted -- only the extracted/uploaded content is kept in memory.
+   deleted -- only the extracted/uploaded content (and, for docx/plain text, a local copy of the
+   raw text) is kept in memory.
 3. The message (text + extracted content) is added to an in-memory **batch buffer** instead of
    being analyzed right away.
 4. The buffer is flushed to Gemini in a single request whenever either:
@@ -20,10 +22,15 @@ Non-opportunity messages are silently ignored.
      period doesn't sit around unanalyzed).
    One Gemini call analyzes the whole batch at once and returns a JSON array with one result per
    message (matched back up by message id), each with `is_opportunity` plus, if true, title, org,
-   summary, requirements, survey/application link, other links, due date, stipend, and location.
-5. Every message in the batch classified as an opportunity gets its own Discord notification via
+   summary, requirements, survey/application link, other links, due date, stipend, location, and
+   a transcription of any image/PDF attachment text (`attachment_text`).
+5. For each message classified as an opportunity, if a Notion mention directory is configured
+   (see below), its text + local attachment text + `attachment_text` is fuzzy-matched (via
+   `rapidfuzz`) against every field of every row in your Notion database. Any matched member gets
+   `<@discord_id>`-mentioned in the notification.
+6. Every message in the batch classified as an opportunity gets its own Discord notification via
    `discord_notifier.py`; the rest are silently skipped.
-6. On shutdown (Ctrl+C), whatever's left in the buffer is flushed before exiting.
+7. On shutdown (Ctrl+C), whatever's left in the buffer is flushed before exiting.
 
 ## Setup
 
@@ -40,6 +47,25 @@ Fill in `.env`:
   (supergroup IDs look like `-1001234567890`).
 - **GEMINI_API_KEY** — from https://aistudio.google.com/apikey
 - **DISCORD_WEBHOOK_URL** — Discord: Server Settings → Integrations → Webhooks → New Webhook → Copy URL
+
+### Optional: @mention people from a Notion database
+
+If you want the bot to `@mention` group members it recognizes in a message (or one of its
+attachments), point it at a Notion database:
+
+1. Create an internal integration at https://www.notion.so/my-integrations and copy its secret
+   into `NOTION_API_KEY`.
+2. Open your database (e.g. the "Telegram Mention DB" with Name / USN / Email / Phone / Discord ID
+   columns), click **`...`** → **Connections** → add your integration.
+3. Copy the database ID out of its URL — `notion.so/<workspace>/<DATABASE_ID>?v=...` — into
+   `NOTION_DATABASE_ID`.
+4. Make sure one column's name contains "discord" (e.g. "Discord ID") holding each member's
+   numeric Discord user ID — that's the only column name the code looks for specifically.
+
+Every other column (Name, USN, Email, Phone, or anything you add later) is read generically and
+used as a fuzzy-match candidate automatically — nothing is hardcoded to specific field names, so
+adding new columns in Notion just works without touching the code. Leave `NOTION_API_KEY` /
+`NOTION_DATABASE_ID` blank to disable the feature entirely.
 
 ## Run
 
@@ -81,3 +107,10 @@ listener.
 - **Batching**: tune `BATCH_SIZE` and `BATCH_INTERVAL_SECONDS` in `.env` to trade off latency vs.
   Gemini call volume. Small group / want near-instant notifications: `BATCH_SIZE=1`. High-traffic
   group: raise `BATCH_SIZE` and/or `BATCH_INTERVAL_SECONDS` to batch more messages per call.
+- **Mentions**: matching is done with `rapidfuzz.fuzz.partial_ratio` against every text-like
+  column value in your Notion database (`fuzzy_matcher.py`). Raise `MENTION_FUZZY_THRESHOLD`
+  (closer to 100) if you get false-positive mentions, or lower it if real matches are being
+  missed. The directory is cached for `NOTION_CACHE_TTL_SECONDS` so adding a new row in Notion
+  can take up to that long to show up. Image/PDF attachment content is only searchable because
+  Gemini transcribes it into `attachment_text` during the same batch call -- docx/plain-text
+  attachments are matched from the locally-extracted copy instead.

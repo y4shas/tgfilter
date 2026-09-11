@@ -14,26 +14,27 @@ from config import (
     DOWNLOAD_DIR,
     BATCH_SIZE,
     BATCH_INTERVAL_SECONDS,
+    MENTIONS_ENABLED,
+    MENTION_FUZZY_THRESHOLD,
     validate_config,
 )
 from gemini_analyzer import analyze_batch, build_attachment_parts, DEFAULT_RESULT
 from discord_notifier import send_notification
 
+if MENTIONS_ENABLED:
+    from notion_directory import get_directory
+    from fuzzy_matcher import find_mentions
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-     handlers=[
-        logging.FileHandler("app.log", mode="a"),
-        logging.StreamHandler(sys.stdout)
-    ]
 )
-
 logger = logging.getLogger("job_watcher")
 
 client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 # Buffer of messages awaiting the next Gemini batch call.
-# Each entry: {"id", "chat_id", "text", "parts", "posted_at"}
+# Each entry: {"id", "chat_id", "text", "parts", "local_text", "posted_at"}
 pending = []
 pending_lock = asyncio.Lock()
 flush_now = asyncio.Event()
@@ -73,7 +74,7 @@ async def build_entry_from_message(message, chat_id):
 
     attachments = await download_attachments(message)
     try:
-        parts = await asyncio.to_thread(build_attachment_parts, attachments)
+        parts, local_text = await asyncio.to_thread(build_attachment_parts, attachments)
     finally:
         for att in attachments:
             try:
@@ -86,6 +87,7 @@ async def build_entry_from_message(message, chat_id):
         "chat_id": chat_id,
         "text": text,
         "parts": parts,
+        "local_text": local_text,
         "posted_at": message.date or datetime.now(timezone.utc),
     }
 
@@ -123,16 +125,34 @@ async def flush_batch():
     logger.info(f"Flushing batch of {len(batch)} message(s) to Gemini...")
     results = await asyncio.to_thread(analyze_batch, batch)
 
+    directory = []
+    if MENTIONS_ENABLED:
+        directory = await asyncio.to_thread(get_directory)
+
     for item in batch:
         analysis = results.get(item["id"], DEFAULT_RESULT)
 
-        if not analysis.get("is_opportunity"):
-            logger.info(f"Message {item['id']} skipped (not an opportunity).")
-            continue
+        mentions = []
+        if MENTIONS_ENABLED and directory:
+            search_text = "\n".join(
+                filter(None, [item["text"], item.get("local_text", ""), analysis.get("attachment_text", "")])
+            )
+            mentions = await asyncio.to_thread(find_mentions, search_text, directory, MENTION_FUZZY_THRESHOLD)
+            if mentions:
+                logger.info(f"Message {item['id']} mentions: {[m['name'] for m in mentions]}")    
 
-        logger.info(f"Message {item['id']} classified as opportunity: {analysis.get('title')!r}")
+        if not analysis.get("is_opportunity") and not mentions:
+            logger.info(f"Message {item['id']} skipped (not an opportunity). no mentions found.")
+            continue
+        elif not analysis.get("is_opportunity") and mentions:
+            logger.info(f"Message {item['id']} not skipped (not an opportunity) but mentions found.")
+            analysis["title"] = "Mentioned in message"
+            # analysis["color"] = 0xE67E22  # orange for mentions-only
+        else:
+            logger.info(f"Message {item['id']} classified as opportunity: {analysis.get('title')!r}")
+
         source_link = build_source_link(item["chat_id"], item["id"])
-        sent = await asyncio.to_thread(send_notification, analysis, source_link, item["posted_at"])
+        sent = await asyncio.to_thread(send_notification, analysis, source_link, item["posted_at"], mentions)
         if sent:
             logger.info(f"Discord notification sent for message {item['id']}.")
         else:
@@ -188,7 +208,8 @@ async def main():
 
     logger.info(
         f"Listening for messages in group {TELEGRAM_GROUP_ID} "
-        f"(batch size={BATCH_SIZE}, max wait={BATCH_INTERVAL_SECONDS}s)..."
+        f"(batch size={BATCH_SIZE}, max wait={BATCH_INTERVAL_SECONDS}s, "
+        f"mentions={'enabled' if MENTIONS_ENABLED else 'disabled'})..."
     )
     asyncio.create_task(batch_flusher())
     try:
